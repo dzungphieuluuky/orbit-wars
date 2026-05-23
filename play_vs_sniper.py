@@ -11,7 +11,7 @@ from typing import Any
 
 import torch
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
+REPO_ROOT = Path(__file__).resolve().parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
@@ -50,24 +50,37 @@ def seed_everything(seed: int) -> None:
 
 
 def build_policy(cfg: TrainConfig, device: torch.device) -> PlanetPolicy:
+    m = cfg.model
     return PlanetPolicy(
-        self_dim=self_feature_dim(),
-        candidate_dim=candidate_feature_dim(),
-        global_dim=global_feature_dim(),
-        candidate_count=cfg.env.candidate_count,
-        hidden_size=cfg.model.hidden_size,
+        self_dim        = SELF_DIM,
+        candidate_dim   = CANDIDATE_DIM,
+        global_dim      = GLOBAL_DIM,
+        candidate_count = cfg.env.candidate_count,
+        hidden_size     = m.hidden_size,
+        num_heads       = getattr(m, "num_heads",       4),
+        num_attn_layers = getattr(m, "num_attn_layers", 2),
+        mlp_ratio       = getattr(m, "mlp_ratio",       2.0),
+        dropout         = getattr(m, "dropout",         0.0),
+        use_memory      = getattr(m, "use_memory",      False),
+        geom_indices    = tuple(getattr(m, "geom_indices", (0, 1, 2, 3))),
+        fourier_bands   = getattr(m, "fourier_bands",   4),
     ).to(device)
 
 
-def load_checkpoint_if_available(policy: PlanetPolicy, checkpoint_path: str | None, device: torch.device) -> None:
+def load_checkpoint_if_available(policy, checkpoint_path, device):
     if checkpoint_path is None:
         return
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     state_dict = checkpoint.get("policy", checkpoint)
+    if any(k.startswith("_orig_mod.") for k in state_dict):
+        state_dict = {
+            (k[len("_orig_mod."):] if k.startswith("_orig_mod.") else k): v
+            for k, v in state_dict.items()
+        }
     policy.load_state_dict(state_dict)
 
 
-def build_moves(batch: TurnBatch, policy: PlanetPolicy, device: torch.device, deterministic: bool) -> list[list[float | int]]:
+def build_moves(batch, policy, device, deterministic, hidden_state=None):
     if batch.self_features.shape[0] == 0:
         return []
     with torch.inference_mode():
@@ -76,6 +89,7 @@ def build_moves(batch: TurnBatch, policy: PlanetPolicy, device: torch.device, de
             torch.from_numpy(batch.candidate_features).to(device),
             torch.from_numpy(batch.global_features).to(device),
             torch.from_numpy(batch.candidate_mask).to(device).bool(),
+            hidden_state,
         )
         sampled = sample_actions(outputs, deterministic=deterministic)
     target_indices = sampled.target_index.detach().cpu().numpy()
@@ -93,7 +107,7 @@ def build_moves(batch: TurnBatch, policy: PlanetPolicy, device: torch.device, de
         if ships <= 0:
             continue
         moves.append([context.source_id, float(context.target_angles[target_idx]), ships])
-    return moves
+    return moves, outputs.hidden_state   # thread through game loop
 
 
 def nearest_planet_sniper(obs: Any) -> list[list[float | int]]:
@@ -166,9 +180,10 @@ def run_match(
     done = extract_status(states[0]) != "ACTIVE"
     step_count = 0
 
+    hidden: torch.Tensor | None = None
     while not done:
         batch = encode_turn(player_obs, cfg.env, env_index=0)
-        player_action = build_moves(batch, policy, device, deterministic)
+        player_action, hidden = build_moves(batch, policy, device, deterministic, hidden)
         opponent_action = nearest_planet_sniper(opponent_obs)
         states = env.step([player_action, opponent_action])
         player_obs = extract_observation(states[0])

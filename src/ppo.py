@@ -1,9 +1,10 @@
-
 from __future__ import annotations
 
 from dataclasses import dataclass
 
 import torch
+import torch.nn.functional as F
+from torch import Tensor
 from torch.distributions import Categorical
 
 from .policy import PolicyOutput
@@ -11,50 +12,84 @@ from .policy import PolicyOutput
 
 @dataclass(slots=True)
 class SampledAction:
-    target_index: torch.Tensor
-    log_prob: torch.Tensor
-    entropy: torch.Tensor
+    target_index: Tensor
+    log_prob: Tensor
+    entropy: Tensor
 
 
 @dataclass(slots=True)
 class TransitionBatch:
-    self_features: torch.Tensor
-    candidate_features: torch.Tensor
-    global_features: torch.Tensor
-    candidate_mask: torch.Tensor
-    target_index: torch.Tensor
-    log_prob: torch.Tensor
-    returns: torch.Tensor
-    advantages: torch.Tensor
+    self_features:      Tensor
+    candidate_features: Tensor
+    global_features:    Tensor
+    candidate_mask:     Tensor
+    target_index:       Tensor
+    log_prob:           Tensor
+    returns:            Tensor
+    advantages:         Tensor
+
+
+# Pre-built zero tensor to avoid allocation in the hot path
+_ZERO = torch.zeros(1)
+
+
+
+def _safe_logits(logits: Tensor) -> Tensor:
+    """Replace fully-invalid rows with a uniform distribution at slot 0."""
+    invalid = ~torch.isfinite(logits).any(dim=-1)   # (N,)
+    if not invalid.any():
+        return logits
+    out = logits.clone()
+    out[invalid, 0] = 0.0
+    return out
 
 
 def sample_actions(outputs: PolicyOutput, deterministic: bool) -> SampledAction:
-    target_logits = safe_target_logits(outputs.target_logits)
-    target_dist = Categorical(logits=target_logits)
-    target_index = target_logits.argmax(dim=-1) if deterministic else target_dist.sample()
+    logits = _safe_logits(outputs.target_logits)
+    if deterministic:
+        idx = logits.argmax(dim=-1)
+    else:
+        idx = Categorical(logits=logits).sample()
 
-    log_prob, entropy = action_log_prob_and_entropy(outputs=outputs, target_index=target_index)
-    return SampledAction(target_index=target_index, log_prob=log_prob, entropy=entropy)
+    lp, ent = _log_prob_and_entropy(logits, idx)
+    return SampledAction(target_index=idx, log_prob=lp, entropy=ent)
+
+
+
+def _log_prob_and_entropy(logits: Tensor, idx: Tensor):
+    dist = Categorical(logits=logits)
+    return dist.log_prob(idx), dist.entropy()
 
 
 def action_log_prob_and_entropy(
     outputs: PolicyOutput,
-    target_index: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    target_logits = safe_target_logits(outputs.target_logits)
-    target_dist = Categorical(logits=target_logits)
-    target_log_prob = target_dist.log_prob(target_index)
-    target_entropy = target_dist.entropy()
-    return target_log_prob, target_entropy
+    target_index: Tensor,
+) -> tuple[Tensor, Tensor]:
+    return _log_prob_and_entropy(_safe_logits(outputs.target_logits), target_index)
 
 
-def safe_target_logits(target_logits: torch.Tensor) -> torch.Tensor:
-    invalid_rows = ~torch.isfinite(target_logits).any(dim=-1)
-    if not invalid_rows.any():
-        return target_logits
-    safe_logits = target_logits.clone()
-    safe_logits[invalid_rows, 0] = 0.0
-    return safe_logits
+
+def _ppo_loss(
+    advantages: Tensor,
+    ratio: Tensor,
+    clip_coef: float,
+    returns_mb: Tensor,
+    value_mb: Tensor,
+    entropy: Tensor,
+    vf_coef: float,
+    ent_coef: float,
+) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    # Clipped surrogate objective
+    pg1 = -advantages * ratio
+    pg2 = -advantages * ratio.clamp(1.0 - clip_coef, 1.0 + clip_coef)
+    policy_loss = torch.maximum(pg1, pg2).mean()
+
+    # Value loss (MSE)
+    value_loss = 0.5 * F.mse_loss(value_mb, returns_mb)
+
+    entropy_mean = entropy.mean()
+    total = policy_loss + vf_coef * value_loss - ent_coef * entropy_mean
+    return total, policy_loss, value_loss, entropy_mean
 
 
 def ppo_update(
@@ -70,50 +105,60 @@ def ppo_update(
     minibatch_size: int,
     device: torch.device,
 ) -> dict[str, float]:
-    if batch.self_features.shape[0] == 0:
+    N = batch.self_features.shape[0]
+    if N == 0:
         return {"loss": 0.0, "policy_loss": 0.0, "value_loss": 0.0, "entropy": 0.0}
-    self_features = batch.self_features.to(device)
-    candidate_features = batch.candidate_features.to(device)
-    global_features = batch.global_features.to(device)
-    candidate_mask = batch.candidate_mask.to(device).bool()
-    old_log_prob = batch.log_prob.to(device)
-    target_index = batch.target_index.to(device)
-    returns = batch.returns.to(device)
-    advantages = batch.advantages.to(device)
-    advantages = (advantages - advantages.mean()) / (advantages.std(unbiased=False) + 1e-8)
-    size = self_features.shape[0]
-    minibatch_size = min(size, max(1, minibatch_size))
-    metrics = {"loss": 0.0, "policy_loss": 0.0, "value_loss": 0.0, "entropy": 0.0}
-    updates = 0
+
+    # ── Transfer to device once, pin if possible ──────────────────
+    pin = device.type == "cuda"
+
+    def _to(t: Tensor) -> Tensor:
+        return t.to(device, non_blocking=True)
+
+    sf   = _to(batch.self_features)
+    cf   = _to(batch.candidate_features)
+    gf   = _to(batch.global_features)
+    cm   = _to(batch.candidate_mask).bool()
+    olp  = _to(batch.log_prob)
+    tidx = _to(batch.target_index)
+    ret  = _to(batch.returns)
+    adv  = _to(batch.advantages)
+
+    # Normalise advantages once (not per minibatch)
+    adv = (adv - adv.mean()) / (adv.std(unbiased=False) + 1e-8)
+
+    mb  = min(N, max(1, minibatch_size))
+    acc = {"loss": 0.0, "policy_loss": 0.0, "value_loss": 0.0, "entropy": 0.0}
+    n_updates = 0
+
     for _ in range(epochs):
-        order = torch.randperm(size, device=device)
-        for start in range(0, size, minibatch_size):
-            idx = order[start : start + minibatch_size]
-            outputs = policy(
-                self_features[idx],
-                candidate_features[idx],
-                global_features[idx],
-                candidate_mask[idx],
+        perm = torch.randperm(N, device=device)
+        for start in range(0, N, mb):
+            idx = perm[start: start + mb]
+
+            outputs = policy(sf[idx], cf[idx], gf[idx], cm[idx])
+            nlp, ent = action_log_prob_and_entropy(outputs, tidx[idx])
+
+            # ratio in log-space for numerical stability
+            ratio = (nlp - olp[idx]).exp()
+
+            loss, pl, vl, em = _ppo_loss(
+                adv[idx], ratio, clip_coef,
+                ret[idx], outputs.value,
+                ent, vf_coef, ent_coef,
             )
-            new_log_prob, entropy = action_log_prob_and_entropy(
-                outputs,
-                target_index[idx],
-            )
-            ratio = (new_log_prob - old_log_prob[idx]).exp()
-            policy_loss = torch.maximum(
-                -advantages[idx] * ratio,
-                -advantages[idx] * torch.clamp(ratio, 1.0 - clip_coef, 1.0 + clip_coef),
-            ).mean()
-            value_loss = 0.5 * (returns[idx] - outputs.value).pow(2).mean()
-            entropy_mean = entropy.mean()
-            loss = policy_loss + vf_coef * value_loss - ent_coef * entropy_mean
+
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(policy.parameters(), max_grad_norm)
             optimizer.step()
-            metrics["loss"] += float(loss.detach().cpu())
-            metrics["policy_loss"] += float(policy_loss.detach().cpu())
-            metrics["value_loss"] += float(value_loss.detach().cpu())
-            metrics["entropy"] += float(entropy_mean.detach().cpu())
-            updates += 1
-    return {key: value / max(updates, 1) for key, value in metrics.items()}
+
+            # Accumulate metrics — detach early to free graph memory
+            acc["loss"]        += loss.detach().item()
+            acc["policy_loss"] += pl.detach().item()
+            acc["value_loss"]  += vl.detach().item()
+            acc["entropy"]     += em.detach().item()
+            n_updates += 1
+
+    inv = 1.0 / max(n_updates, 1)
+    return {k: v * inv for k, v in acc.items()}
